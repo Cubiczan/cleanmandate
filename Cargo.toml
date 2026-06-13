@@ -23,6 +23,7 @@ cm-policy = { path = "crates/cm-policy" }
 cm-cleanverse = { path = "crates/cm-cleanverse" }
 cm-chp = { path = "crates/cm-chp" }
 cm-executor = { path = "crates/cm-executor" }
+resilient-call = { git = "https://github.com/icohangar-ops/cubiczan-resilience" }
 anyhow = "1.0"
 chrono = { version = "0.4", features = ["serde"] }
 clap = { version = "4.5", features = ["derive", "env"] }

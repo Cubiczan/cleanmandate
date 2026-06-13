@@ -3,16 +3,20 @@ use crate::types::{
     TokenTransferResult,
 };
 use reqwest::Client;
+use resilient_call::{retry, with_timeout, ResilienceError, RetryPolicy};
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
 use thiserror::Error;
 use uuid::Uuid;
 
 /// Connect + read timeout for every live Cleanverse call. Without this a hung
-/// API would block the payment agent indefinitely.
+/// API would block the payment agent indefinitely. Enforced both on the
+/// reqwest client (defense in depth) and via `resilient_call::with_timeout`
+/// around each attempt.
 const HTTP_TIMEOUT: Duration = Duration::from_secs(30);
-/// Number of additional attempts after the first failure for transient errors.
-const MAX_RETRIES: u32 = 2;
+/// Total attempts (initial + retries) for transient errors. Backoff schedule
+/// and full jitter are owned by `resilient_call::RetryPolicy`.
+const MAX_ATTEMPTS: u32 = 3;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CleanverseMode {
@@ -52,6 +56,8 @@ pub enum CleanverseError {
     Http(#[from] reqwest::Error),
     #[error("api error: {0}")]
     Api(String),
+    #[error("encode error: {0}")]
+    Encode(#[source] serde_json::Error),
 }
 
 pub struct CleanverseClient {
@@ -164,56 +170,73 @@ impl CleanverseClient {
         idempotency_key: Option<&str>,
     ) -> Result<R, CleanverseError> {
         let url = format!("{}{}", self.config.api_base.trim_end_matches('/'), path);
+        let body_json = serde_json::to_value(body).map_err(CleanverseError::Encode)?;
 
-        let mut attempt: u32 = 0;
-        loop {
-            let mut req = self.http.post(&url).json(body);
+        // Exponential backoff + full jitter and the retry/timeout wrappers are
+        // provided by `resilient-call`; the closure is re-run per attempt so
+        // each retry rebuilds a fresh request. The Idempotency-Key header makes
+        // those retries safe even if a prior attempt reached the server before
+        // the connection failed/timed out.
+        let policy = RetryPolicy::with_max_attempts(MAX_ATTEMPTS)
+            .base_delay(Duration::from_millis(200))
+            .max_delay(Duration::from_secs(4));
+
+        let attempt = || async {
+            let mut req = self.http.post(&url).json(&body_json);
             if let Some(key) = &self.config.api_key {
                 req = req.header("Authorization", format!("Bearer {key}"));
             }
-            // An idempotency key makes a retry safe even if a prior attempt
-            // reached the server before the connection failed/timed out.
             if let Some(idem) = idempotency_key {
                 req = req.header("Idempotency-Key", idem);
             }
 
-            match req.send().await {
-                Ok(resp) => {
+            // Bound each individual attempt with the typed timeout wrapper in
+            // addition to the reqwest client-level timeout.
+            with_timeout(
+                async {
+                    let resp = req.send().await?;
                     let status = resp.status();
                     if status.is_success() {
-                        return Ok(resp.json().await?);
+                        return resp.json::<R>().await.map_err(CleanverseError::Http);
                     }
-                    // Retry transient server-side failures (5xx / 429); surface
-                    // 4xx (business) errors immediately.
-                    let retryable =
-                        status.is_server_error() || status.as_u16() == 429;
                     let text = resp.text().await.unwrap_or_default();
-                    if retryable && attempt < MAX_RETRIES {
-                        attempt += 1;
-                        Self::backoff(attempt).await;
-                        continue;
-                    }
-                    return Err(CleanverseError::Api(format!("{status}: {text}")));
+                    Err(CleanverseError::Api(format!("{status}: {text}")))
+                },
+                HTTP_TIMEOUT,
+            )
+            .await
+            // Flatten the timeout wrapper's error into our domain error so the
+            // classifier sees a single `CleanverseError`.
+            .map_err(|e| match e {
+                ResilienceError::Timeout(d) => {
+                    CleanverseError::Api(format!("attempt timed out after {d:?}"))
                 }
-                Err(e) => {
-                    // Network-level errors (timeout, connect, send) are
-                    // transient; retry with the idempotency key in place.
-                    let transient =
-                        e.is_timeout() || e.is_connect() || e.is_request();
-                    if transient && attempt < MAX_RETRIES {
-                        attempt += 1;
-                        Self::backoff(attempt).await;
-                        continue;
-                    }
-                    return Err(CleanverseError::Http(e));
+                ResilienceError::Terminal(inner) | ResilienceError::Exhausted { source: inner, .. } => inner,
+            })
+        };
+
+        retry(attempt, &policy, Self::is_retryable)
+            .await
+            .map_err(|e| match e {
+                ResilienceError::Timeout(d) => {
+                    CleanverseError::Api(format!("timed out after {d:?}"))
                 }
-            }
-        }
+                ResilienceError::Terminal(inner) | ResilienceError::Exhausted { source: inner, .. } => inner,
+            })
     }
 
-    async fn backoff(attempt: u32) {
-        // Exponential backoff: 200ms, 400ms, ...
-        let millis = 200u64.saturating_mul(2u64.saturating_pow(attempt - 1));
-        tokio::time::sleep(Duration::from_millis(millis)).await;
+    /// Retry transient server-side failures (5xx / 429) and network-level
+    /// errors (timeout, connect, send); surface 4xx business errors and
+    /// decode failures immediately.
+    fn is_retryable(err: &CleanverseError) -> bool {
+        match err {
+            CleanverseError::Http(e) => e.is_timeout() || e.is_connect() || e.is_request(),
+            CleanverseError::Api(msg) => {
+                msg.starts_with("attempt timed out")
+                    || msg.starts_with("5")
+                    || msg.starts_with("429")
+            }
+            CleanverseError::Encode(_) => false,
+        }
     }
 }
