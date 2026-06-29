@@ -84,6 +84,13 @@ Environment:
 
 See [docs/CLEANVERSE_INTEGRATION.md](docs/CLEANVERSE_INTEGRATION.md) and [docs/DEMO.md](docs/DEMO.md).
 
+## Cubiczan stack
+
+| Finance | [Strata](https://github.com/Cubiczan/Strata) · [Metabocommand](https://github.com/Cubiczan/Metabocommand) · [meshcfo](https://github.com/Cubiczan/meshcfo) · [working-capital-optimizer](https://github.com/Cubiczan/working-capital-optimizer) · [cash-flow-optimizer](https://github.com/Cubiczan/cash-flow-optimizer) |
+| Governance | [consensus-hardening-protocol](https://github.com/Cubiczan/consensus-hardening-protocol) · [agent-conductor](https://github.com/Cubiczan/agent-conductor) · [compliance-as-code-agent](https://github.com/Cubiczan/compliance-as-code-agent) · **cleanmandate** |
+
+CleanMandate is the **payment rail** for agent commerce — CHP locks and Metabocommand approvals gate spend before A-Token settlement.
+
 ## Business plan / deck
 
 Hackathon submission deck: [docs/business-plan/cleanmandate-deck.pdf](docs/business-plan/cleanmandate-deck.pdf)
